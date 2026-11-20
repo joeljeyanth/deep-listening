@@ -4,3 +4,4 @@ scipy
 librosa
 matplotlib
 onnxruntime
+imageio-ffmpeg

@@ -1,20 +1,9 @@
+import os
 import streamlit as st
-import importlib
-
-try:
-    np = importlib.import_module("numpy")
-except ImportError:
-    st.error("NumPy is required. Install it with: pip install numpy")
-    st.stop()
-
+import numpy as np
 import matplotlib.pyplot as plt
 import librosa.display
-
-try:
-    ort = importlib.import_module("onnxruntime")
-except ImportError:
-    ort = None
-
+import onnxruntime as ort
 from preprocess import process_audio, TARGET_SR
 
 CLASSES = ["Normal", "Crackle", "Wheeze", "Both"]
@@ -30,15 +19,17 @@ def load_onnx_model():
 session = load_onnx_model()
 input_name = session.get_inputs()[0].name
 
-uploaded_file = st.file_uploader("Upload Chest Sound Recording (.wav)", type=["wav"])
+uploaded_file = st.file_uploader("Upload Chest Sound Recording (.wav, .mp3, or .mp4)", type=["wav", "mp3", "mp4"])
 
 if uploaded_file is not None:
-    with open("temp_audio.wav", "wb") as f:
+    file_ext = os.path.splitext(uploaded_file.name)[1].lower()
+    temp_path = f"temp_upload{file_ext}"
+    with open(temp_path, "wb") as f:
         f.write(uploaded_file.getbuffer())
 
-    st.audio("temp_audio.wav")
+    st.audio(temp_path)
 
-    y_clean, log_mel = process_audio("temp_audio.wav")
+    y_clean, full_log_mel, windows = process_audio(temp_path)
 
     col1, col2 = st.columns(2)
     with col1:
@@ -51,13 +42,17 @@ if uploaded_file is not None:
     with col2:
         st.subheader("Log-Mel Spectrogram")
         fig2, ax2 = plt.subplots(figsize=(6, 3))
-        img = librosa.display.specshow(log_mel, sr=TARGET_SR, x_axis="time", y_axis="mel", fmax=2500, ax=ax2)
+        img = librosa.display.specshow(full_log_mel, sr=TARGET_SR, x_axis="time", y_axis="mel", fmax=2500, ax=ax2)
         fig2.colorbar(img, ax=ax2, format="%+2.0f dB")
         st.pyplot(fig2)
 
-    # Run fast ONNX inference
-    model_input = log_mel[np.newaxis, ..., np.newaxis].astype(np.float32)
-    probs = session.run(None, {input_name: model_input})[0][0]
+    # Evaluate every 3-second breath window across the recording
+    window_probs = session.run(None, {input_name: windows})[0]
+
+    # Select the window with the highest abnormal probability (1 - P(Normal))
+    abnormal_scores = 1.0 - window_probs[:, 0]
+    peak_window_idx = int(np.argmax(abnormal_scores))
+    probs = window_probs[peak_window_idx]
 
     top_idx = int(np.argmax(probs))
     top_class = CLASSES[top_idx]
@@ -66,15 +61,16 @@ if uploaded_file is not None:
     st.divider()
     res1, res2 = st.columns([1, 2])
     with res1:
-        st.metric("Flagged Acoustic Event", top_class, f"{confidence:.1f}% Confidence")
+        st.metric("Flagged Acoustic Event", top_class, f"{confidence:.1f}% Confidence (Window {peak_window_idx + 1}/{len(windows)})")
         report = (
             f"DEEP LISTENING SCREENING REPORT\n"
-            f"Primary Flag: {top_class} ({confidence:.2f}%)\n\n"
+            f"Primary Flag: {top_class} ({confidence:.2f}%)\n"
+            f"Analyzed Windows: {len(windows)} (3s segments)\n\n"
             + "\n".join([f"{c}: {p*100:.2f}%" for c, p in zip(CLASSES, probs)])
             + "\n\nDisclaimer: Triage prototype only; requires clinical verification."
         )
         st.download_button("Download Triage Report", data=report, file_name="screening_report.txt")
 
     with res2:
-        st.subheader("Acoustic Event Probability Breakdown")
+        st.subheader("Peak Window Probability Breakdown")
         st.bar_chart({CLASSES[i]: float(probs[i]) for i in range(len(CLASSES))})
